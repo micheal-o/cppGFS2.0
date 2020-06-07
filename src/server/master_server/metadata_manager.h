@@ -6,6 +6,7 @@
 #include "src/common/utils.h"
 #include "src/protos/metadata.pb.h"
 #include "src/server/master_server/lock_manager.h"
+#include "src/server/master_server/chunk_server_manager.h"
 
 namespace gfs {
 namespace server {
@@ -127,6 +128,9 @@ class MetadataManager {
 
   // Lock manager to manager the synchronization of operations
   LockManager* lock_manager_;
+
+  // Chunk server manager
+  ChunkServerManager& chunk_server_manager_ = ChunkServerManager::GetInstance();
 };
 
 }  // namespace server
