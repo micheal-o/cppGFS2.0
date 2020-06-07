@@ -108,6 +108,7 @@ grpc::Status MasterMetadataServiceImpl::HandleFileChunkCreation(
       LOG(WARNING) << "InitFileChunkRequest for " << chunk_handle
                    << " sent to chunk server " << server_address
                    << " failed: " << init_chunk_or.status().error_message();
+      // should undo file creation and file allocations
       return common::utils::ConvertProtobufStatusToGrpcStatus(
           init_chunk_or.status());
     } else {
@@ -324,7 +325,7 @@ grpc::Status MasterMetadataServiceImpl::HandleFileChunkWrite(
     }
     const std::string& chunk_server_address(
         chunk_server_hostname + ":" +
-        std::to_string(reply->metadata().primary_location().server_port()));
+        std::to_string(location.server_port()));
     auto lease_service_client(
         GetOrCreateChunkServerProtocolClient(chunk_server_address));
 
