@@ -45,7 +45,7 @@ disk:
     chunk_server_03: data/gfs_db_chunk_server_03
 timeout:
   # The valid suffixes are "ns", "us" "ms", "s", "m", and "h".
-  grpc: 10s
+  grpc: 30s
   lease: 60s
   heartbeat: 30s
   client_cache: 10m
