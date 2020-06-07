@@ -450,7 +450,7 @@ ClientImpl::WriteFileChunk(const char* filename, void* buffer,
         }
       continue;
     }
-    retry--;
+    break;
   }
 
   if (!retry) {
