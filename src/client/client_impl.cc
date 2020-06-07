@@ -368,6 +368,9 @@ ClientImpl::WriteFileChunk(const char* filename, void* buffer,
       }
       auto server_address(server_hostname + ":" +
                           std::to_string(location.server_port()));
+      // TODO(tugan,xi): don't re-send the data if it was successful
+      // But we also have to know that if we wait long enough due to retry, the
+      // data cache on chunk server may already have expired
       send_data_threads.push_back(std::thread([&, server_address]() {
         // Prepare the SendChunkDataRequest
         SendChunkDataRequest send_chunk_data_request;
@@ -434,91 +437,113 @@ ClientImpl::WriteFileChunk(const char* filename, void* buffer,
 
     if (send_data_recoverable_error.load()) {
       retry--;
+
+      LOG(INFO) << "refresh metadata cache before retrying sending data";
+      // refresh status, in case things have changed as we encountered errors
+      auto get_metadata_status = GetMetadataForChunk(
+            filename, chunk_index, OpenFileRequest::WRITE, chunk_handle,
+            chunk_version, chunk_server_location_entry, true);
+        if (!get_metadata_status.ok()) {
+          LOG(ERROR) << "Refreshing metadata cache failed due to "
+                      << get_metadata_status;
+          return get_metadata_status;
+        }
       continue;
     }
-
-    // Prepare WriteFileChunkRequest, WriteFileChunkRequestHeader
-    WriteFileChunkRequest write_request;
-    write_request.mutable_header()->set_chunk_handle(chunk_handle);
-    write_request.mutable_header()->set_chunk_version(chunk_version);
-    write_request.mutable_header()->set_offset_start(offset);
-    write_request.mutable_header()->set_length(nbytes);
-    write_request.mutable_header()->set_data_checksum(data_checksum);
-    for (auto location : chunk_server_location_entry.locations) {
-      write_request.mutable_replica_locations()->Add(std::move(location));
-    }
-    // Prepare the client context
-    grpc::ClientContext client_context;
-    common::SetClientContextDeadline(client_context, config_manager_);
-
-    // We send this WriteFileChunkRequest to the primary
-    auto primary_location(chunk_server_location_entry.primary_location);
-    std::string primary_hostname = primary_location.server_hostname();
-    if (resolve_hostname_) {
-      primary_hostname = config_manager_->ResolveHostname(primary_hostname);
-    }
-    const std::string primary_server_address(
-        primary_hostname + ":" +
-        std::to_string(primary_location.server_port()));
-
-    auto primary_server_service_client(
-        GetChunkServerServiceClient(primary_server_address));
-    // Issue WriteFileChunkRequest and check status
-    StatusOr<WriteFileChunkReply> write_reply_or(
-        primary_server_service_client->SendRequest(write_request,
-                                                   client_context));
-
-    // Handle grpc error, and retry if possible
-    if (!write_reply_or.ok()) {
-      LOG(ERROR) << "Send write chunk data request to "
-                 << primary_server_address << "failed due to "
-                 << write_reply_or.status();
-    } else {
-      auto write_reply(write_reply_or.ValueOrDie());
-      switch (write_reply.status()) {
-        case FileChunkMutationStatus::OK:
-          LOG(INFO) << "Write to file " << filename << " at chunk_index "
-                    << chunk_index << " and offset " << offset << " for "
-                    << nbytes << " bytes succeeds";
-          return write_reply_or;
-        case FileChunkMutationStatus::FAILED_NOT_LEASE_HOLDER:
-          // Client found out that the primary it though is no longer a lease
-          // holder, we need to force to get the chunk metadata and retry
-          LOG(INFO) << "Retrying as primary server " << primary_server_address
-                    << " is no longer lease holder "
-                    << "refetching chunk metadata";
-          get_metadata_status = GetMetadataForChunk(
-              filename, chunk_index, OpenFileRequest::WRITE, chunk_handle,
-              chunk_version, chunk_server_location_entry, true);
-          if (!get_metadata_status.ok()) {
-            LOG(ERROR) << "Refreshing metadata cache failed due to "
-                       << get_metadata_status;
-            return get_metadata_status;
-          }
-          break;
-        default:
-          // For other cases, we consider them to be irrecoverable and return
-          // error
-          LOG(ERROR) << "Write to file " << filename << " at chunk_index "
-                     << chunk_index << " and offset " << offset << " for "
-                     << nbytes << " byte failed due to "
-                     << write_reply.status();
-          return google::protobuf::util::Status(
-              google::protobuf::util::error::INTERNAL,
-              "Write to file " + std::string(filename) + " at chunk_index " +
-                  std::to_string(chunk_index) + " and offset " +
-                  std::to_string(offset) + "for " + std::to_string(nbytes) +
-                  " failed due to internal error");
-      }
-    }
-
     retry--;
   }
 
-  LOG(ERROR) << "Write file chunk failed after 3 retries";
-  return google::protobuf::util::Status(
-      google::protobuf::util::error::INTERNAL,
-      "Write file chunk failed after 3 retries");
+  if (!retry) {
+    LOG(ERROR) << "Send file chunk failed after 3 retries";
+    return google::protobuf::util::Status(
+        google::protobuf::util::error::INTERNAL,
+        "Write file chunk failed after 3 retries");
+  }
+
+  // TODO(tugan): currently, we don't auto-retry writes for simplicity
+  // Otherwise, too many cases such as re-trying if a cache is invalid on
+  // chunk server now and we need to re-send the data
+
+  // Prepare WriteFileChunkRequest, WriteFileChunkRequestHeader
+  WriteFileChunkRequest write_request;
+  write_request.mutable_header()->set_chunk_handle(chunk_handle);
+  write_request.mutable_header()->set_chunk_version(chunk_version);
+  write_request.mutable_header()->set_offset_start(offset);
+  write_request.mutable_header()->set_length(nbytes);
+  write_request.mutable_header()->set_data_checksum(data_checksum);
+  for (auto location : chunk_server_location_entry.locations) {
+    write_request.mutable_replica_locations()->Add(std::move(location));
+  }
+  // Prepare the client context
+  grpc::ClientContext client_context;
+  common::SetClientContextDeadline(client_context, config_manager_);
+
+  // We send this WriteFileChunkRequest to the primary
+  auto primary_location(chunk_server_location_entry.primary_location);
+  std::string primary_hostname = primary_location.server_hostname();
+  if (resolve_hostname_) {
+    primary_hostname = config_manager_->ResolveHostname(primary_hostname);
+  }
+  const std::string primary_server_address(
+      primary_hostname + ":" +
+      std::to_string(primary_location.server_port()));
+
+  auto primary_server_service_client(
+      GetChunkServerServiceClient(primary_server_address));
+  // Issue WriteFileChunkRequest and check status
+  StatusOr<WriteFileChunkReply> write_reply_or(
+      primary_server_service_client->SendRequest(write_request,
+                                                  client_context));
+
+  // Handle grpc error, and retry if possible
+  if (!write_reply_or.ok()) {
+    LOG(ERROR) << "Send write chunk data request to "
+                << primary_server_address << "failed due to "
+                << write_reply_or.status();
+    return write_reply_or.status();
+  
+  } else {
+    auto write_reply(write_reply_or.ValueOrDie());
+    switch (write_reply.status()) {
+      case FileChunkMutationStatus::OK:
+        LOG(INFO) << "Write to file " << filename << " at chunk_index "
+                  << chunk_index << " and offset " << offset << " for "
+                  << nbytes << " bytes succeeds";
+        return write_reply_or;
+      case FileChunkMutationStatus::FAILED_NOT_LEASE_HOLDER:
+        // Client found out that the primary it though is no longer a lease
+        // holder, we need to force to get the chunk metadata and retry
+        // LOG(INFO) << "Retrying as primary server " << primary_server_address
+        //           << " is no longer lease holder "
+        //           << "refetching chunk metadata";
+        // get_metadata_status = GetMetadataForChunk(
+        //     filename, chunk_index, OpenFileRequest::WRITE, chunk_handle,
+        //     chunk_version, chunk_server_location_entry, true);
+        // if (!get_metadata_status.ok()) {
+        //   LOG(ERROR) << "Refreshing metadata cache failed due to "
+        //               << get_metadata_status;
+        //   return get_metadata_status;
+        // }
+        // break;
+        return google::protobuf::util::Status(
+            google::protobuf::util::error::UNAVAILABLE, 
+            "The primary replica no longer holds the lease: " + 
+            primary_server_address);
+      default:
+        // For other cases, we consider them to be irrecoverable and return
+        // error
+        LOG(ERROR) << "Write to file " << filename << " at chunk_index "
+                    << chunk_index << " and offset " << offset << " for "
+                    << nbytes << " byte failed due to "
+                    << write_reply.status();
+        return google::protobuf::util::Status(
+            google::protobuf::util::error::INTERNAL,
+            "Write to file " + std::string(filename) + " at chunk_index " +
+                std::to_string(chunk_index) + " and offset " +
+                std::to_string(offset) + "for " + std::to_string(nbytes) +
+                " failed due to internal error");
+    }
+  }
 }
 
 google::protobuf::util::Status ClientImpl::WriteFile(const char* filename,
